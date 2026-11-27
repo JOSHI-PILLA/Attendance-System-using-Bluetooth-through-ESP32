@@ -1,0 +1,604 @@
+#include "BluetoothSerial.h"
+#include "esp_bt_device.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <vector>
+#include <time.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled. Select the "ESP32 Dev Module" board in Tools > Board.
+#endif
+
+// NOTE: Bluetooth + Wi-Fi make the sketch large.
+// Tools > Partition Scheme > "Huge APP (3MB No OTA/1MB SPIFFS)"
+
+// ================= SETTINGS =================
+const char* BT_NAME = "Attendance-ESP32";
+
+// Professor login
+const char* PROF_USER = "  ";
+const char* PROF_PASS = "  ";        // CHANGE THIS
+
+// The ESP32 creates its own Wi-Fi so the dashboard always works:
+const char* AP_SSID = "  ";
+const char* AP_PASS = " ";        // min 8 characters
+
+// Optional: also join your router (leave STA_SSID "" to skip)
+const char* STA_SSID = " ";
+const char* STA_PASS = " ";
+
+// One phone = one student. Set to 1 only after the Bluetooth callback matches your library.
+#define DEVICE_LOCK 0
+
+const long TZ_OFFSET_SEC = 19800;          // India (UTC+5:30). Only used if router/NTP is available
+const int  MAX_STUDENTS  = 50;
+// ============================================
+
+BluetoothSerial SerialBT;
+WebServer server(80);
+Preferences prefs;
+
+struct Student {
+  String code;
+  String name;
+  bool present;
+  String markedAt;
+  String device;     // Bluetooth MAC of the phone that marked this student
+};
+std::vector<Student> students;
+
+String sessionToken = "";
+
+// ---------- remember which phone is connected ----------
+char lastMac[18] = "";
+
+#if DEVICE_LOCK
+void btEvent(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+  if (event == ESP_SPP_SRV_OPEN_EVT) {
+    snprintf(lastMac, sizeof(lastMac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             param->srv_open.rem_bda[0], param->srv_open.rem_bda[1],
+             param->srv_open.rem_bda[2], param->srv_open.rem_bda[3],
+             param->srv_open.rem_bda[4], param->srv_open.rem_bda[5]);
+  } else if (event == ESP_SPP_CLOSE_EVT) {
+    lastMac[0] = 0;
+  }
+}
+#endif
+
+// ---------- helpers ----------
+String clean(String s) {
+  s.trim();
+  s.toUpperCase();
+  return s;
+}
+
+String cleanCode(String s) {
+  s.trim();
+  s.toUpperCase();
+  String o = "";
+  for (size_t i = 0; i < s.length() && o.length() < 16; i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c)) o += c;
+  }
+  return o;
+}
+
+String cleanName(String s) {
+  s.trim();
+  String o = "";
+  for (size_t i = 0; i < s.length() && o.length() < 24; i++) {
+    char c = s[i];
+    if (c == '|' || c == '\n' || c == '\r' || c == '"' || c == '\\') continue;
+    o += c;
+  }
+  return o;
+}
+
+int findByCode(const String& code) {
+  for (size_t i = 0; i < students.size(); i++)
+    if (students[i].code == code) return (int)i;
+  return -1;
+}
+
+String nowText() {
+  time_t t = time(nullptr);
+  if (t > 1700000000) {
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char b[24];
+    strftime(b, sizeof(b), "%Y-%m-%d %H:%M:%S", &tmv);
+    return String(b);
+  }
+  return "uptime " + String(millis() / 1000) + "s";
+}
+
+// ---------- storage (survives power-off) ----------
+void saveData() {
+  String d = "";
+  for (auto& s : students) {
+    d += s.code + "|" + s.name + "|" + (s.present ? "1" : "0") + "|" + s.markedAt + "|" + s.device + "\n";
+  }
+  prefs.putString("data", d);
+}
+
+void loadData() {
+  students.clear();
+  String d = prefs.getString("data", "");
+  if (d.length() == 0 && !prefs.isKey("data")) {
+    // first run: default class list
+    const char* codes[] = {"JOSHI", "JAYANTH", "INDRA", "IMRAN", "SHOAIB"};
+    const char* names[] = {"Joshi", "Jayanth", "Indra", "Imran", "Shoaib"};
+    for (int i = 0; i < 5; i++) students.push_back({codes[i], names[i], false, "", ""});
+    saveData();
+    return;
+  }
+  int start = 0;
+  while (start < (int)d.length()) {
+    int end = d.indexOf('\n', start);
+    if (end < 0) end = d.length();
+    String line = d.substring(start, end);
+    start = end + 1;
+    int p1 = line.indexOf('|');
+    int p2 = line.indexOf('|', p1 + 1);
+    int p3 = line.indexOf('|', p2 + 1);
+    if (p1 < 0 || p2 < 0 || p3 < 0) continue;
+    int p4 = line.indexOf('|', p3 + 1);
+    Student s;
+    s.code = line.substring(0, p1);
+    s.name = line.substring(p1 + 1, p2);
+    s.present = line.substring(p2 + 1, p3) == "1";
+    if (p4 < 0) {
+      s.markedAt = line.substring(p3 + 1);
+      s.device = "";
+    } else {
+      s.markedAt = line.substring(p3 + 1, p4);
+      s.device = line.substring(p4 + 1);
+    }
+    students.push_back(s);
+  }
+}
+
+// ---------- serial status ----------
+void printStatus(Stream& out) {
+  out.println("\n========== Attendance ==========");
+  for (auto& s : students) {
+    out.printf("%-8s %-10s %s", s.code.c_str(), s.name.c_str(), s.present ? "PRESENT" : "ABSENT");
+    if (s.present) out.printf("  (%s)", s.markedAt.c_str());
+    out.println();
+  }
+  out.println("================================");
+}
+
+void resetAll() {
+  for (auto& s : students) {
+    s.present = false;
+    s.markedAt = "";
+    s.device = "";
+  }
+  saveData();
+  Serial.println("Attendance reset. All students ABSENT.");
+}
+
+// ---------- Bluetooth (student side) ----------
+void handlePhoneLine(const String& code) {
+  if (code == "HELP") {
+    SerialBT.println("Type your code, for example JOSHI, and press send.");
+    return;
+  }
+
+  int idx = findByCode(code);
+  if (idx < 0) {
+    SerialBT.printf("Unknown code: %s\n", code.c_str());
+    return;
+  }
+
+  if (students[idx].present) {
+    SerialBT.printf("%s is already marked present.\n", students[idx].name.c_str());
+    return;
+  }
+
+  String mac = String(lastMac);
+#if DEVICE_LOCK
+  if (mac.length() == 0) {
+    SerialBT.println("Could not identify your phone. Disconnect, reconnect and try again.");
+    return;
+  }
+  for (size_t i = 0; i < students.size(); i++) {
+    if (students[i].present && students[i].device == mac) {
+      SerialBT.printf("BLOCKED: this phone already marked %s present. One phone = one student.\n",
+                      students[i].name.c_str());
+      Serial.printf("BLOCKED: phone %s tried to mark %s (already used for %s)\n",
+                    mac.c_str(), students[idx].name.c_str(), students[i].name.c_str());
+      delay(1500);
+      SerialBT.disconnect();
+      while (SerialBT.available()) SerialBT.read();
+      return;
+    }
+  }
+#endif
+
+  students[idx].present = true;
+  students[idx].markedAt = nowText();
+  students[idx].device = mac;
+  saveData();
+  Serial.printf("%s (%s) marked PRESENT\n", students[idx].name.c_str(), students[idx].code.c_str());
+
+  SerialBT.printf("OK %s marked PRESENT\n", students[idx].name.c_str());
+  SerialBT.println("Disconnecting. The next student can connect now.");
+  delay(1500);
+  SerialBT.disconnect();
+
+  while (SerialBT.available()) SerialBT.read();
+}
+
+void handleSerialLine(const String& cmd) {
+  if (cmd == "STATUS") printStatus(Serial);
+  else if (cmd == "RESET") resetAll();
+  else if (cmd.length() > 0) Serial.println("Commands: STATUS, RESET");
+}
+
+// ---------- dashboard web page ----------
+const char INDEX_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attendance Dashboard</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--tx:#1b2333;--mut:#6b7587;--bd:#e1e5ee;--pri:#2f5fe3;--ok:#18864b;--okb:#e1f5e9;--bad:#b3261e;--badb:#fde8e6}
+@media(prefers-color-scheme:dark){:root{--bg:#10141c;--card:#1a202c;--tx:#e8ecf4;--mut:#93a0b8;--bd:#2a3344;--pri:#6c8cff;--ok:#5fd394;--okb:#16352a;--bad:#ff8a80;--badb:#3a1c1a}}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
+.wrap{max-width:900px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 12px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+input{padding:10px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font-size:14px}
+button,.btn{padding:10px 14px;border:0;border-radius:8px;background:var(--pri);color:#fff;font-size:14px;cursor:pointer;text-decoration:none;display:inline-block}
+button.sec{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+button.del{background:var(--badb);color:var(--bad)}
+button.sm{padding:6px 10px;font-size:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row input{flex:1;min-width:130px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.stat{background:var(--bg);border-radius:10px;padding:12px;text-align:center}
+.stat b{display:block;font-size:24px}.stat span{font-size:12px;color:var(--mut)}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--bd);white-space:nowrap}
+th{color:var(--mut);font-weight:500;font-size:12px}
+.pill{padding:3px 10px;border-radius:99px;font-size:12px}
+.p{background:var(--okb);color:var(--ok)}.a{background:var(--badb);color:var(--bad)}
+#login{max-width:340px;margin:12vh auto}
+#login input{width:100%;margin-bottom:10px}#login button{width:100%}
+.err{color:var(--bad);font-size:13px;min-height:18px;margin-bottom:6px}
+.hide{display:none}
+</style></head><body>
+<div class="wrap">
+
+<div id="login" class="card hide">
+  <h1 style="margin-bottom:14px">Professor Login</h1>
+  <input id="u" placeholder="Username" autocomplete="username">
+  <input id="p" type="password" placeholder="Password" autocomplete="current-password">
+  <div class="err" id="lerr"></div>
+  <button onclick="login()">Sign in</button>
+</div>
+
+<div id="dash" class="hide">
+  <div class="top">
+    <h1>Attendance Dashboard</h1>
+    <div class="row">
+      <a class="btn" href="/api/download">Download CSV</a>
+      <button class="sec" onclick="logout()">Logout</button>
+    </div>
+  </div>
+
+  <div class="card"><div class="stats">
+    <div class="stat"><b id="sT">0</b><span>Total</span></div>
+    <div class="stat"><b id="sP" style="color:var(--ok)">0</b><span>Present</span></div>
+    <div class="stat"><b id="sA" style="color:var(--bad)">0</b><span>Absent</span></div>
+  </div></div>
+
+  <div class="card">
+    <h2>Add student</h2>
+    <div class="row">
+      <input id="ncode" placeholder="Code (e.g. RAVI)" maxlength="16">
+      <input id="nname" placeholder="Full name" maxlength="24">
+      <button onclick="addStu()">Add</button>
+    </div>
+    <div class="err" id="aerr" style="margin:8px 0 0"></div>
+  </div>
+
+  <div class="card">
+    <div class="top" style="margin-bottom:8px">
+      <h2 style="margin:0">Attendance report</h2>
+      <div class="row">
+        <input id="q" placeholder="Search..." oninput="render()" style="min-width:120px">
+        <button class="sec" onclick="newSession()">New session (reset)</button>
+      </div>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>#</th><th>Code</th><th>Name</th><th>Status</th><th>Marked at</th><th>Phone</th><th>Actions</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </div>
+</div>
+</div>
+
+<script>
+let data=[];
+const $=id=>document.getElementById(id);
+async function post(path,obj){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(obj||{})});
+  if(r.status===401){showLogin();throw new Error('auth');}
+  return r.json();
+}
+function showLogin(){$('dash').classList.add('hide');$('login').classList.remove('hide');}
+function showDash(){$('login').classList.add('hide');$('dash').classList.remove('hide');}
+async function login(){
+  $('lerr').textContent='';
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({user:$('u').value,pass:$('p').value})});
+  if(r.ok){$('p').value='';load();}else $('lerr').textContent='Wrong username or password';
+}
+async function logout(){await fetch('/api/logout',{method:'POST'});showLogin();}
+async function load(){
+  const r=await fetch('/api/students');
+  if(r.status===401){showLogin();return;}
+  const j=await r.json();data=j.students;
+  $('sT').textContent=j.total;$('sP').textContent=j.present;$('sA').textContent=j.total-j.present;
+  showDash();render();
+}
+function render(){
+  const q=$('q').value.toLowerCase();
+  const tb=$('rows');tb.innerHTML='';
+  data.filter(s=>s.code.toLowerCase().includes(q)||s.name.toLowerCase().includes(q)).forEach((s,i)=>{
+    const tr=document.createElement('tr');
+    const cells=[i+1,s.code,s.name];
+    cells.forEach(c=>{const td=document.createElement('td');td.textContent=c;tr.appendChild(td);});
+    let td=document.createElement('td');
+    const sp=document.createElement('span');sp.className='pill '+(s.present?'p':'a');sp.textContent=s.present?'Present':'Absent';
+    td.appendChild(sp);tr.appendChild(td);
+    td=document.createElement('td');td.textContent=s.time||'-';tr.appendChild(td);
+    td=document.createElement('td');td.textContent=s.device||'-';tr.appendChild(td);
+    td=document.createElement('td');
+    const b1=document.createElement('button');b1.className='sec sm';b1.textContent=s.present?'Mark absent':'Mark present';
+    b1.onclick=()=>post('/api/mark',{code:s.code,present:s.present?0:1}).then(load);
+    const b2=document.createElement('button');b2.className='del sm';b2.textContent='Delete';b2.style.marginLeft='6px';
+    b2.onclick=()=>{if(confirm('Delete '+s.name+'?'))post('/api/delete',{code:s.code}).then(load);};
+    td.appendChild(b1);td.appendChild(b2);tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+}
+async function addStu(){
+  $('aerr').textContent='';
+  const r=await post('/api/add',{code:$('ncode').value,name:$('nname').value});
+  if(r.ok){$('ncode').value='';$('nname').value='';load();}else $('aerr').textContent=r.error;
+}
+function newSession(){if(confirm('Mark everyone ABSENT and start a new session? Download the CSV first if you need it.'))post('/api/reset').then(load);}
+$('p').addEventListener('keydown',e=>{if(e.key==='Enter')login();});
+load();
+setInterval(()=>{if(!$('dash').classList.contains('hide'))load();},5000);
+</script>
+</body></html>
+)HTML";
+
+// ---------- web handlers ----------
+bool isAuthed() {
+  if (sessionToken.length() == 0) return false;
+  String c = server.header("Cookie");
+  return c.indexOf("sid=" + sessionToken) >= 0;
+}
+
+bool requireAuth() {
+  if (isAuthed()) return true;
+  server.send(401, "application/json", "{\"error\":\"login required\"}");
+  return false;
+}
+
+String jsonEscape(const String& s) {
+  String o = "";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if (c == '\n' || c == '\r') o += ' ';
+    else o += c;
+  }
+  return o;
+}
+
+String csvEscape(const String& s) {
+  String o = "\"";
+  for (size_t i = 0; i < s.length(); i++) {
+    if (s[i] == '"') o += "\"\"";
+    else o += s[i];
+  }
+  return o + "\"";
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleLogin() {
+  if (server.arg("user") == PROF_USER && server.arg("pass") == PROF_PASS) {
+    sessionToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
+    server.sendHeader("Set-Cookie", "sid=" + sessionToken + "; Path=/; HttpOnly");
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    delay(600);  // slows down password guessing
+    server.send(403, "application/json", "{\"ok\":false}");
+  }
+}
+
+void handleLogout() {
+  sessionToken = "";
+  server.sendHeader("Set-Cookie", "sid=; Path=/; Max-Age=0");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStudents() {
+  if (!requireAuth()) return;
+  int present = 0;
+  String j = "{\"students\":[";
+  for (size_t i = 0; i < students.size(); i++) {
+    if (i) j += ",";
+    if (students[i].present) present++;
+    j += "{\"code\":\"" + jsonEscape(students[i].code) + "\",";
+    j += "\"name\":\"" + jsonEscape(students[i].name) + "\",";
+    j += String("\"present\":") + (students[i].present ? "true" : "false") + ",";
+    j += "\"time\":\"" + jsonEscape(students[i].markedAt) + "\",";
+    j += "\"device\":\"" + jsonEscape(students[i].device) + "\"}";
+  }
+  j += "],\"total\":" + String(students.size()) + ",\"present\":" + String(present) + "}";
+  server.send(200, "application/json", j);
+}
+
+void handleAdd() {
+  if (!requireAuth()) return;
+  String code = cleanCode(server.arg("code"));
+  String name = cleanName(server.arg("name"));
+  if (code.length() == 0 || name.length() == 0) {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"Code and name are required (code: letters/numbers only)\"}");
+    return;
+  }
+  if (code == "HELP") {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"HELP is a reserved code\"}");
+    return;
+  }
+  if (findByCode(code) >= 0) {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"That code already exists\"}");
+    return;
+  }
+  if ((int)students.size() >= MAX_STUDENTS) {
+    server.send(200, "application/json", "{\"ok\":false,\"error\":\"Student limit reached\"}");
+    return;
+  }
+  students.push_back({code, name, false, "", ""});
+  saveData();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleDelete() {
+  if (!requireAuth()) return;
+  int idx = findByCode(cleanCode(server.arg("code")));
+  if (idx >= 0) {
+    students.erase(students.begin() + idx);
+    saveData();
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleMark() {
+  if (!requireAuth()) return;
+  int idx = findByCode(cleanCode(server.arg("code")));
+  if (idx >= 0) {
+    bool p = server.arg("present") == "1";
+    students[idx].present = p;
+    students[idx].markedAt = p ? nowText() + " (manual)" : "";
+    students[idx].device = "";   // marking absent frees that phone to be used again
+    saveData();
+  }
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleReset() {
+  if (!requireAuth()) return;
+  resetAll();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleDownload() {
+  if (!requireAuth()) return;
+  String csv = "Code,Name,Status,Marked At,Phone\r\n";
+  for (auto& s : students) {
+    csv += csvEscape(s.code) + "," + csvEscape(s.name) + "," +
+           (s.present ? "Present" : "Absent") + "," + csvEscape(s.markedAt) + "," +
+           csvEscape(s.device) + "\r\n";
+  }
+  server.sendHeader("Content-Disposition", "attachment; filename=\"attendance.csv\"");
+  server.send(200, "text/csv", csv);
+}
+
+void setupWeb() {
+  const char* keys[] = {"Cookie"};
+  server.collectHeaders(keys, 1);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/login", HTTP_POST, handleLogin);
+  server.on("/api/logout", HTTP_POST, handleLogout);
+  server.on("/api/students", HTTP_GET, handleStudents);
+  server.on("/api/add", HTTP_POST, handleAdd);
+  server.on("/api/delete", HTTP_POST, handleDelete);
+  server.on("/api/mark", HTTP_POST, handleMark);
+  server.on("/api/reset", HTTP_POST, handleReset);
+  server.on("/api/download", HTTP_GET, handleDownload);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  prefs.begin("attend", false);
+  loadData();
+
+#if DEVICE_LOCK
+  SerialBT.register_callback(btEvent);   // lets us see which phone connected
+#endif
+  bool ok = static_cast<bool>(SerialBT.begin(BT_NAME));
+  if (!ok) {
+    Serial.println("ERROR: Bluetooth failed to start.");
+    Serial.println("Check that the board is an original ESP32 and that");
+    Serial.println("Tools > Board is set to ESP32 Dev Module.");
+    while (true) delay(1000);
+  }
+
+  Serial.println("Bluetooth started OK.");
+  Serial.printf("Bluetooth name: %s\n", BT_NAME);
+
+  const uint8_t* mac = esp_bt_dev_get_address();
+  if (mac) {
+    Serial.printf("Bluetooth address: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+
+  // Wi-Fi: own hotspot + (optional) router
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("Dashboard Wi-Fi: %s  (password: %s)\n", AP_SSID, AP_PASS);
+  Serial.printf("Dashboard URL:   http://%s\n", WiFi.softAPIP().toString().c_str());
+
+  if (strlen(STA_SSID) > 0) {
+    WiFi.begin(STA_SSID, STA_PASS);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(250);
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("Router URL:      http://%s\n", WiFi.localIP().toString().c_str());
+      configTime(TZ_OFFSET_SEC, 0, "pool.ntp.org", "time.nist.gov");
+    } else {
+      Serial.println("Router connection failed (hotspot still works).");
+    }
+  }
+
+  setupWeb();
+
+  Serial.println("Phones: connect to Attendance-ESP32 and send your code.");
+  Serial.println("USB commands: STATUS, RESET");
+  printStatus(Serial);
+}
+
+void loop() {
+  server.handleClient();
+
+  if (SerialBT.available()) {
+    String line = clean(SerialBT.readStringUntil('\n'));
+    if (line.length() > 0) handlePhoneLine(line);
+  }
+
+  if (Serial.available()) {
+    String line = clean(Serial.readStringUntil('\n'));
+    handleSerialLine(line);
+  }
+}
